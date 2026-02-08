@@ -1,13 +1,15 @@
 # =========================================================
 # Streamlit 기반 스마트폰 과의존 실태조사 RAG 챗봇
+# (Hugging Face Hub에서 Chroma DB 다운로드 버전)
 # =========================================================
 import streamlit as st
 import json
 import re
 import os
 import pandas as pd
+import shutil
+from pathlib import Path
 from typing import Dict, Any, List, Optional, TypedDict
-from contextlib import contextmanager
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
@@ -34,13 +36,11 @@ st.set_page_config(
 # =========================================================
 st.markdown("""
 <style>
-    /* 메인 컨테이너 */
     .main .block-container {
         padding-top: 2rem;
         padding-bottom: 2rem;
     }
     
-    /* 채팅 메시지 스타일 */
     .user-message {
         background-color: #e3f2fd;
         padding: 1rem;
@@ -57,12 +57,10 @@ st.markdown("""
         border-left: 4px solid #424242;
     }
     
-    /* 테이블 스타일 */
     .dataframe {
         font-size: 14px !important;
     }
     
-    /* 진행 상태 표시 */
     .status-box {
         background-color: #fff3e0;
         padding: 0.5rem 1rem;
@@ -71,7 +69,6 @@ st.markdown("""
         margin: 0.5rem 0;
     }
     
-    /* 출처 표시 */
     .source-tag {
         background-color: #e8f5e9;
         padding: 0.2rem 0.5rem;
@@ -80,12 +77,6 @@ st.markdown("""
         color: #2e7d32;
     }
     
-    /* 사이드바 스타일 */
-    .sidebar .sidebar-content {
-        background-color: #fafafa;
-    }
-    
-    /* 헤더 스타일 */
     h1 {
         color: #1a237e;
     }
@@ -114,6 +105,13 @@ BOT_IDENTITY = """2020~2024년 스마트폰 과의존 실태조사 보고서 분
 - 조사 방법론 및 표본 설계 정보
 """
 
+# =========================================================
+# Hugging Face 설정 - 여기를 수정하세요!
+# =========================================================
+# Hugging Face Dataset 정보 (본인 것으로 변경)
+HF_REPO_ID = "YOUR_HF_USERNAME/smartphone-addiction-chroma-db"  # 예: "minseung/smartphone-addiction-chroma-db"
+LOCAL_DB_PATH = "./chroma_db_store"
+
 # 검색 파라미터
 N_QUERIES = 3
 K_PER_QUERY = 6
@@ -132,11 +130,8 @@ if "messages" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-if "initialized" not in st.session_state:
-    st.session_state.initialized = False
-
-if "current_status" not in st.session_state:
-    st.session_state.current_status = ""
+if "db_downloaded" not in st.session_state:
+    st.session_state.db_downloaded = False
 
 # =========================================================
 # LangGraph State 정의
@@ -160,11 +155,39 @@ class GraphState(TypedDict):
     debug_info: Optional[Dict[str, Any]]
 
 # =========================================================
+# Hugging Face에서 DB 다운로드
+# =========================================================
+@st.cache_resource
+def download_chroma_db():
+    """Hugging Face Hub에서 Chroma DB 다운로드"""
+    
+    # 이미 로컬에 있으면 스킵
+    if os.path.exists(LOCAL_DB_PATH) and os.listdir(LOCAL_DB_PATH):
+        return LOCAL_DB_PATH, None
+    
+    try:
+        from huggingface_hub import snapshot_download
+        
+        # 다운로드
+        downloaded_path = snapshot_download(
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            local_dir=LOCAL_DB_PATH,
+            local_dir_use_symlinks=False
+        )
+        
+        return downloaded_path, None
+        
+    except Exception as e:
+        return None, str(e)
+
+# =========================================================
 # 초기화 함수
 # =========================================================
 @st.cache_resource
 def init_resources():
     """리소스 초기화 (캐시됨)"""
+    
     # API 키 설정
     api_key = None
     
@@ -191,13 +214,16 @@ def init_resources():
     
     os.environ['OPENAI_API_KEY'] = api_key
     
-    # Chroma 설정
-    PERSIST_DIR = "./chroma_db_store"
+    # Chroma DB 경로 확인
+    db_path = LOCAL_DB_PATH
+    
+    if not os.path.exists(db_path):
+        return None, None, f"Chroma DB를 찾을 수 없습니다: {db_path}"
     
     try:
         embedding = OpenAIEmbeddings(model='text-embedding-3-large')
         vectorstore = Chroma(
-            persist_directory=PERSIST_DIR,
+            persist_directory=db_path,
             embedding_function=embedding,
             collection_name="pdf_pages_with_summary_v2"
         )
@@ -337,7 +363,7 @@ def _keyword_boost_score(doc: Document, must_terms: List[str]) -> float:
 # 테이블 파싱 및 렌더링
 # =========================================================
 def parse_markdown_table(text: str) -> List[Dict[str, Any]]:
-    """마크다운 테이블을 파싱하여 DataFrame으로 변환 가능한 형태로 반환"""
+    """마크다운 테이블을 파싱"""
     tables = []
     lines = text.split('\n')
     
@@ -345,11 +371,9 @@ def parse_markdown_table(text: str) -> List[Dict[str, Any]]:
     while i < len(lines):
         line = lines[i].strip()
         
-        # 테이블 시작 감지 (| 로 시작하고 | 로 끝남)
         if line.startswith('|') and line.endswith('|'):
             table_lines = []
             
-            # 테이블 행 수집
             while i < len(lines):
                 line = lines[i].strip()
                 if line.startswith('|') and line.endswith('|'):
@@ -362,11 +386,9 @@ def parse_markdown_table(text: str) -> List[Dict[str, Any]]:
                     break
             
             if len(table_lines) >= 2:
-                # 헤더 파싱
                 header_line = table_lines[0]
                 headers = [h.strip() for h in header_line.split('|')[1:-1]]
                 
-                # 데이터 행 파싱
                 data_rows = []
                 for row_line in table_lines[1:]:
                     if '---' in row_line:
@@ -391,15 +413,8 @@ def render_table(headers: List[str], rows: List[List[str]]) -> None:
     """테이블을 Streamlit DataFrame으로 렌더링"""
     try:
         df = pd.DataFrame(rows, columns=headers)
-        
-        # 숫자 컬럼 정렬을 위한 스타일링
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
-        # 실패 시 마크다운으로 폴백
         st.markdown("| " + " | ".join(headers) + " |")
         st.markdown("| " + " | ".join(["---"] * len(headers)) + " |")
         for row in rows:
@@ -410,26 +425,21 @@ def render_answer_with_tables(answer: str) -> None:
     tables = parse_markdown_table(answer)
     
     if not tables:
-        # 테이블 없으면 그냥 마크다운으로 렌더링
         st.markdown(answer)
         return
     
-    # 테이블이 있으면 분리하여 렌더링
     lines = answer.split('\n')
     current_pos = 0
     
     for table in tables:
-        # 테이블 이전 텍스트
         before_text = '\n'.join(lines[current_pos:table['start_idx']])
         if before_text.strip():
             st.markdown(before_text)
         
-        # 테이블 렌더링
         render_table(table['headers'], table['rows'])
         
         current_pos = table['end_idx']
     
-    # 마지막 테이블 이후 텍스트
     after_text = '\n'.join(lines[current_pos:])
     if after_text.strip():
         st.markdown(after_text)
@@ -559,13 +569,12 @@ def get_validator_prompt():
     ])
 
 # =========================================================
-# 노드 함수들 (진행 상태 업데이트 포함)
+# 노드 함수들
 # =========================================================
 def create_node_functions(vectorstore, llms, status_placeholder):
     """노드 함수들을 생성하고 반환"""
     
     def update_status(message: str):
-        """상태 업데이트"""
         status_placeholder.markdown(f"""
         <div style="background-color: #fff3e0; padding: 0.8rem 1rem; border-radius: 8px; 
                     border-left: 4px solid #ff9800; margin: 0.5rem 0;">
@@ -595,7 +604,6 @@ def create_node_functions(vectorstore, llms, status_placeholder):
             })
             state["intent_raw"] = result.strip().upper()
             
-            # 가드 로직
             if re.search(r"\b(20[2][0-4])\s*년?\b", user_input):
                 state["intent"] = "RAG"
                 return state
@@ -1002,11 +1010,9 @@ def build_graph(node_functions):
     """LangGraph 빌드"""
     workflow = StateGraph(GraphState)
     
-    # 노드 추가
     for name, func in node_functions.items():
         workflow.add_node(name, func)
     
-    # 라우팅 함수
     def route_by_intent(state: GraphState) -> str:
         intent = state.get("intent", "RAG")
         if intent == "SMALLTALK":
@@ -1024,7 +1030,6 @@ def build_graph(node_functions):
             return "clarify"
         return "retrieve"
     
-    # 엣지 설정
     workflow.set_entry_point("route_intent")
     
     workflow.add_conditional_edges(
@@ -1075,7 +1080,7 @@ def main():
         
         st.subheader("데이터 범위")
         for year, filename in YEAR_TO_FILENAME.items():
-            st.caption(f"• {year}년: {filename[:30]}...")
+            st.caption(f"• {year}년")
         
         st.divider()
         
@@ -1086,26 +1091,50 @@ def main():
         
         st.divider()
         
-        # 디버그 모드
         debug_mode = st.checkbox("디버그 모드", value=False)
+        
+        st.divider()
+        st.caption(f"DB 경로: {LOCAL_DB_PATH}")
+        st.caption(f"HF Repo: {HF_REPO_ID}")
     
+    # =========================================================
+    # DB 다운로드 (필요시)
+    # =========================================================
+    if not os.path.exists(LOCAL_DB_PATH) or not os.listdir(LOCAL_DB_PATH):
+        st.info("🔄 Chroma DB를 다운로드하고 있습니다. 잠시만 기다려주세요...")
+        
+        with st.spinner("Hugging Face에서 데이터베이스 다운로드 중..."):
+            db_path, error = download_chroma_db()
+        
+        if error:
+            st.error(f"DB 다운로드 실패: {error}")
+            st.info("HF_REPO_ID를 확인해주세요.")
+            return
+        else:
+            st.success("DB 다운로드 완료!")
+            st.rerun()
+    
+    # =========================================================
     # 리소스 초기화
+    # =========================================================
     vectorstore, llms, error = init_resources()
     
     if error:
         st.error(f"초기화 오류: {error}")
-        st.info("API 키를 설정해주세요. (secrets.toml 또는 환경변수)")
         
-        # API 키 입력 폼
-        with st.form("api_key_form"):
-            api_key = st.text_input("OpenAI API 키", type="password")
-            submitted = st.form_submit_button("설정")
-            if submitted and api_key:
-                os.environ['OPENAI_API_KEY'] = api_key
-                st.rerun()
+        if "API" in error:
+            st.info("OpenAI API 키를 설정해주세요.")
+            with st.form("api_key_form"):
+                api_key = st.text_input("OpenAI API 키", type="password")
+                submitted = st.form_submit_button("설정")
+                if submitted and api_key:
+                    os.environ['OPENAI_API_KEY'] = api_key
+                    st.rerun()
         return
     
+    # =========================================================
     # 채팅 히스토리 표시
+    # =========================================================
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             if message["role"] == "assistant":
@@ -1113,24 +1142,20 @@ def main():
             else:
                 st.markdown(message["content"])
     
+    # =========================================================
     # 사용자 입력
+    # =========================================================
     if prompt := st.chat_input("질문을 입력하세요..."):
-        # 사용자 메시지 추가
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # 어시스턴트 응답
         with st.chat_message("assistant"):
-            # 상태 표시용 placeholder
             status_placeholder = st.empty()
             answer_placeholder = st.empty()
             
             try:
-                # 노드 함수 생성
                 node_functions = create_node_functions(vectorstore, llms, status_placeholder)
-                
-                # 그래프 빌드 및 실행
                 graph = build_graph(node_functions)
                 
                 config = {"configurable": {"thread_id": "streamlit_session"}}
@@ -1144,16 +1169,13 @@ def main():
                     config=config
                 )
                 
-                # 상태 표시 제거
                 status_placeholder.empty()
                 
-                # 답변 표시
                 final_answer = result.get("final_answer", "답변을 생성하지 못했습니다.")
                 
                 with answer_placeholder.container():
                     render_answer_with_tables(final_answer)
                 
-                # 디버그 정보
                 if debug_mode:
                     with st.expander("🔍 디버그 정보", expanded=False):
                         col1, col2 = st.columns(2)
@@ -1172,17 +1194,11 @@ def main():
                             st.subheader("Retrieval")
                             st.write(f"검색 파일: {result['retrieval'].get('files_searched', [])}")
                             st.write(f"문서 수: {len(result['retrieval'].get('docs', []))}")
-                        
-                        if result.get("validator_result"):
-                            st.subheader("Validator")
-                            st.json(result["validator_result"])
                 
-                # 히스토리 업데이트
                 st.session_state.messages.append({"role": "assistant", "content": final_answer})
                 st.session_state.chat_history.append(HumanMessage(content=prompt))
                 st.session_state.chat_history.append(AIMessage(content=final_answer))
                 
-                # 히스토리 제한
                 if len(st.session_state.chat_history) > 20:
                     st.session_state.chat_history = st.session_state.chat_history[-20:]
                 
