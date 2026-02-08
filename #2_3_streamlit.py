@@ -109,7 +109,7 @@ BOT_IDENTITY = """2020~2024년 스마트폰 과의존 실태조사 보고서 분
 # Hugging Face 설정 - 여기를 수정하세요!
 # =========================================================
 # Hugging Face Dataset 정보 (본인 것으로 변경)
-HF_REPO_ID = "YOUR_HF_USERNAME/smartphone-addiction-chroma-db"  # 예: "minseung/smartphone-addiction-chroma-db"
+HF_REPO_ID = "Rosaldowithbaek/smartphone-addiction-chroma-db"  # 예: "minseung/smartphone-addiction-chroma-db"
 LOCAL_DB_PATH = "./chroma_db_store"
 
 # 검색 파라미터
@@ -1211,3 +1211,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
